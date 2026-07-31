@@ -1,0 +1,460 @@
+services:
+  # ───────────────────────────────────────────────────────────────
+  # Infrastructure
+  # ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: zm_postgres
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-postgres}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.5
+    container_name: zm_keycloak
+    command: start-dev --http-port=8080 --import-realm
+    ports:
+      - "${KEYCLOAK_PORT:-8181}:8080"
+    environment:
+      - KEYCLOAK_ADMIN=${KEYCLOAK_ADMIN:-admin}
+      - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      - KC_DB=postgres
+      - KC_DB_URL=jdbc:postgresql://postgres:5432/keycloak
+      - KC_DB_USERNAME=keycloak
+      - KC_DB_PASSWORD=keycloak
+      - KC_HEALTH_ENABLED=true
+      # Without this, Keycloak derives the issuer from whatever host the
+      # request arrived on. A browser reaching it as localhost:8181 got tokens
+      # issued by localhost:8181, while zm-iam-service — which must use the
+      # container name — got tokens issued by keycloak:8080. Both are valid
+      # tokens for the same user in the same realm, and ivy-events-be rejects
+      # one of them, because a resource server matches the issuer exactly.
+      # Login through IAM therefore returned a token that failed on the very
+      # next request with "The iss claim is not valid".
+      # Pinning the frontend URL makes every token say the same thing.
+      - KC_HOSTNAME_URL=http://localhost:${KEYCLOAK_PORT:-8181}
+      - KC_HOSTNAME_ADMIN_URL=http://localhost:${KEYCLOAK_PORT:-8181}
+      - KC_HOSTNAME_STRICT=false
+      - KC_HOSTNAME_STRICT_BACKCHANNEL=false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./keycloak/realms:/opt/keycloak/data/import:ro
+    restart: unless-stopped
+
+  # One-shot: seeds the confidential admin client (client-credentials) that
+  # zm-iam-service uses to reach the Keycloak Admin API, then exits. Its
+  # successful exit is the readiness gate the backends depend on.
+  keycloak-bootstrap:
+    image: quay.io/keycloak/keycloak:24.0.5
+    container_name: zm_keycloak_bootstrap
+    depends_on:
+      keycloak:
+        condition: service_started
+    entrypoint: ["bash", "/bootstrap/bootstrap.sh"]
+    environment:
+      - KC_SERVER=http://keycloak:8080
+      - KC_ADMIN=${KEYCLOAK_ADMIN:-admin}
+      - KC_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      - ADMIN_CLIENT_ID=${IAM_ADMIN_CLIENT_ID:-zm-admin-cli}
+      - ADMIN_CLIENT_SECRET=${IAM_ADMIN_CLIENT_SECRET:-zm-admin-secret}
+    volumes:
+      - ./keycloak/bootstrap.sh:/bootstrap/bootstrap.sh:ro
+    restart: "no"
+
+  kafka:
+    image: apache/kafka:3.7.1
+    container_name: zm_kafka
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+    environment:
+      # KRaft single-node (combined broker + controller)
+      - KAFKA_NODE_ID=1
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093
+      - KAFKA_LISTENERS=HOST://0.0.0.0:9092,DOCKER://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      - KAFKA_ADVERTISED_LISTENERS=HOST://localhost:9092,DOCKER://kafka:29092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,HOST:PLAINTEXT,DOCKER:PLAINTEXT
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_INTER_BROKER_LISTENER_NAME=DOCKER
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
+      - KAFKA_LOG_DIRS=/var/lib/kafka/data
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    restart: unless-stopped
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: zm_kafka_ui
+    ports:
+      - "${KAFKA_UI_PORT:-8090}:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:29092
+      - DYNAMIC_CONFIG_ENABLED=true
+    depends_on:
+      - kafka
+    restart: unless-stopped
+
+  # ───────────────────────────────────────────────────────────────
+  # Application services (built in Docker — JDK 21 lives in the image,
+  # host Java version is irrelevant)
+  # ───────────────────────────────────────────────────────────────
+  zm-notification-service:
+    build:
+      context: ../zm-notification-service
+    container_name: zm_notification_service
+    ports:
+      - "${NOTIFICATION_PORT:-8384}:8384"
+    environment:
+      - SERVER_PORT=8384
+      # Kafka DOCKER listener on the compose network.
+      - KAFKA_BOOTSTRAP=kafka:29092
+      - NOTIFICATION_TOPIC=zm.notifications.v1
+      # ZeptoMail from-address/name (secret is baked as a default in the
+      # service's application.yml — this service is its single owner now).
+      - ZEPTO_FROM_ADDRESS=${ZEPTO_FROM_ADDRESS:-noreply@ivyevents.mk}
+      - ZEPTO_FROM_NAME=${ZEPTO_FROM_NAME:-Ivy Events}
+    depends_on:
+      - kafka
+    restart: unless-stopped
+
+  zm-iam-service:
+    build:
+      context: ../zm-iam-service
+    container_name: zm_iam_service
+    ports:
+      # Host port only. In-network callers still use zm-iam-service:8383,
+      # which is what every other service's IAM_BASE_URL points at and what
+      # the prod/test deploy workflows publish — leave the container port be.
+      - "${IAM_PORT:-8282}:8383"
+    environment:
+      - SERVER_PORT=8383
+      - DB_URL=jdbc:postgresql://postgres:5432/iam_db
+      - DB_USER=iam_user
+      - DB_PASSWORD=iam_pass
+      - KEYCLOAK_BASE_URL=http://keycloak:8080
+      - KEYCLOAK_ADMIN_CLIENT_ID=${IAM_ADMIN_CLIENT_ID:-zm-admin-cli}
+      - KEYCLOAK_ADMIN_CLIENT_SECRET=${IAM_ADMIN_CLIENT_SECRET:-zm-admin-secret}
+      - KEYCLOAK_ADMIN_REALM=master
+      - IAM_SELF_BOOTSTRAP_ENABLED=true
+      - IAM_ZM_SERVICES_REALM=zm-services
+      # MENU-01: the public-auth flow needs to know which realm a menu-domain
+      # request belongs to, and which public client to use for the password
+      # grant in that realm. Without both, signup and login for the menu
+      # product land in event-app.
+      - IAM_MENU_APP_CLIENT_ID=menuFE
+      # Origin keys MUST use bracket notation. Spring flattens a nested JSON
+      # object into dotted property names and then strips characters that are
+      # illegal in a property element — the colon in "localhost:5173" among
+      # them — so the nested form binds a key nobody ever looks up and every
+      # public-auth call 400s with "Could not resolve realm". Inside [ ] the
+      # key is taken literally.
+      - 'SPRING_APPLICATION_JSON={"iam.public-auth.origin-to-realm[localhost:5173]":"event-app","iam.public-auth.origin-to-realm[localhost:5174]":"menu-app","iam.public-auth.realm-client-ids":{"menu-app":"menuFE","event-app":"eventFE"}}'
+      # LOCAL ONLY: skip the provisioning-token gate. The filter's escape hatch
+      # now authenticates as the requested serviceId when disabled (grants
+      # ROLE_PROVISIONING), so ivy-events-be's manifest applies without minting
+      # argon2 tokens. Prod/test leave this unset (defaults true) + real tokens.
+      - IAM_PROVISIONING_SECURITY_ENABLED=false
+      # Google IdP creds referenced by ivy-events-be's iam-manifest.yml via
+      # clientIdEnvRef/clientSecretEnvRef. IAM (IdpReconciler) resolves these
+      # from ITS OWN env at apply time — if unset it throws before any Keycloak
+      # write and rolls back the whole manifest, so eventFE never gets created.
+      - IVY_GOOGLE_CLIENT_ID=${IVY_GOOGLE_CLIENT_ID:-}
+      - IVY_GOOGLE_CLIENT_SECRET=${IVY_GOOGLE_CLIENT_SECRET:-}
+      # Route public-auth emails through zm-notification-service over Kafka
+      # (async). Locally Kafka is present, so turn events ON here.
+      - KAFKA_BOOTSTRAP=kafka:29092
+      - IAM_NOTIFICATIONS_VIA_EVENTS=true
+      - NOTIFICATION_TOPIC=zm.notifications.v1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak-bootstrap:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Restaurant menus. Unlike the platform services this product has end users,
+  # so its manifest declares a whole menu-app realm, not just a svc client.
+  zm-menu-service:
+    build:
+      context: ../zm-menu-service
+    container_name: zm_menu_service
+    ports:
+      - "${MENU_PORT:-8585}:8585"
+    environment:
+      - SERVER_PORT=8585
+      - DB_URL=jdbc:postgresql://postgres:5432/menu_db
+      - DB_USER=menu_user
+      - DB_PASSWORD=menu_pass
+      # Read twice: by ManifestLoader when it interpolates iam-manifest.yml at
+      # startup, and by menu.app-domain for building public menu URLs. One
+      # variable so the redirect URIs in Keycloak and the links the service
+      # emits can never disagree.
+      - APP_DOMAIN=${MENU_APP_DOMAIN:-localhost:5174}
+      # Browser-minted tokens carry the localhost issuer, so validation must
+      # expect it; only the key-set fetch is redirected in-network.
+      - MENU_APP_ISSUER_URI=http://localhost:${KEYCLOAK_PORT:-8181}/realms/menu-app
+      - MENU_APP_JWK_SET_URI=http://keycloak:8080/realms/menu-app/protocol/openid-connect/certs
+      - IAM_TOKEN_URL=http://keycloak:8080/realms/zm-services/protocol/openid-connect/token
+      - ORG_BASE_URL=http://zm-organization-service:8484
+      - IAM_BASE_URL=http://zm-iam-service:8383
+      - IAM_PROVISIONING_TOKEN=local-dev-token
+      - IAM_PROVISIONING_FAILURE_MODE=LOG_AND_CONTINUE
+    depends_on:
+      menu-db-bootstrap:
+        condition: service_completed_successfully
+      keycloak-bootstrap:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Guest menu + owner admin. nginx sends /{slug} to the backend so a crawler
+  # gets a real head; everything else is the SPA.
+  zm-menu-fe:
+    build:
+      context: ../zm-menu-fe
+    container_name: zm_menu_fe
+    ports:
+      - "${MENU_FE_PORT:-5174}:80"
+    environment:
+      - KEYCLOAK_URL=http://localhost:${KEYCLOAK_PORT:-8181}
+      - KEYCLOAK_REALM=menu-app
+      - KEYCLOAK_CLIENT_ID=menuFE
+    depends_on:
+      - zm-menu-service
+    restart: unless-stopped
+
+  # One-shot: creates menu_db + menu_user if they are missing, then exits.
+  # Same reason as org-db-bootstrap below — postgres/init only runs on an empty
+  # volume, and nobody should have to destroy their data to gain a database.
+  menu-db-bootstrap:
+    image: postgres:16-alpine
+    container_name: zm_menu_db_bootstrap
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - PGPASSWORD=${POSTGRES_PASSWORD:-postgres}
+    entrypoint:
+      - sh
+      - -c
+      - |
+        psql -h postgres -U ${POSTGRES_USER:-postgres} -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+        SELECT 'CREATE ROLE menu_user WITH LOGIN PASSWORD ''menu_pass'''
+        WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'menu_user')\gexec
+
+        SELECT 'CREATE DATABASE menu_db OWNER menu_user'
+        WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'menu_db')\gexec
+        SQL
+    restart: "no"
+
+  # One-shot: creates org_db + org_user if they are missing, then exits.
+  #
+  # postgres/init/01-init.sql only runs when the pg_data volume is empty, so on
+  # any machine that already ran this stack a newly added database would never
+  # appear. Rather than asking everyone to `down -v` and lose their data, this
+  # step is idempotent and safe to re-run — the same \gexec pattern the deploy
+  # workflows use on the droplets.
+  org-db-bootstrap:
+    image: postgres:16-alpine
+    container_name: zm_org_db_bootstrap
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - PGPASSWORD=${POSTGRES_PASSWORD:-postgres}
+    entrypoint:
+      - sh
+      - -c
+      - |
+        psql -h postgres -U ${POSTGRES_USER:-postgres} -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+        SELECT 'CREATE ROLE org_user WITH LOGIN PASSWORD ''org_pass'''
+        WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'org_user')\gexec
+
+        SELECT 'CREATE DATABASE org_db OWNER org_user'
+        WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'org_db')\gexec
+        SQL
+    restart: "no"
+
+  # Platform registry of business identity (organizations, locations,
+  # membership). Data-only: its manifest declares just a svc client in
+  # zm-services, no application realm.
+  zm-organization-service:
+    build:
+      context: ../zm-organization-service
+    container_name: zm_organization_service
+    ports:
+      - "${ORG_PORT:-8484}:8484"
+    environment:
+      - SERVER_PORT=8484
+      - DB_URL=jdbc:postgresql://postgres:5432/org_db
+      - DB_USER=org_user
+      - DB_PASSWORD=org_pass
+      # Provisioning against the in-network IAM. The token gate is disabled on
+      # this stack (IAM_PROVISIONING_SECURITY_ENABLED=false above), so the
+      # placeholder token is accepted — see the zm-iam-service block.
+      - IAM_BASE_URL=http://zm-iam-service:8383
+      - IAM_PROVISIONING_TOKEN=local-dev-token
+      # IAM may still be starting; retry rather than killing the container.
+      - IAM_PROVISIONING_FAILURE_MODE=LOG_AND_CONTINUE
+      # Callers mint their tokens in-network via keycloak:8080, so that is the
+      # issuer Keycloak stamps into them — validating against localhost:8181
+      # would reject every service-to-service call. The key set is fetched from
+      # the same host, and lazily, so this service still boots without Keycloak.
+      # Issuer is the canonical one Keycloak now stamps into every token
+      # (KC_HOSTNAME_URL), NOT the address this container reaches it on. A
+      # resource server compares the issuer string exactly, so pointing this at
+      # keycloak:8080 refuses perfectly good tokens with a bare 401 — no role
+      # is even looked at. The key fetch below stays internal, because
+      # localhost:8181 is not reachable from inside the network.
+      - IAM_INTERNAL_ISSUER_URI=http://localhost:${KEYCLOAK_PORT:-8181}/realms/zm-services
+      - IAM_INTERNAL_JWK_SET_URI=http://keycloak:8080/realms/zm-services/protocol/openid-connect/certs
+    depends_on:
+      org-db-bootstrap:
+        condition: service_completed_successfully
+      keycloak-bootstrap:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  ivy-events-be:
+    build:
+      context: ..
+      dockerfile: zm-local-setup/docker/ivy-events-be.Dockerfile
+    container_name: zm_ivy_events_be
+    ports:
+      - "${IVY_BE_PORT:-8081}:8081"
+    environment:
+      - SERVER_PORT=8081
+      # Full IAM-authority mode: BE must NOT touch the Keycloak Admin API.
+      # This disables the legacy RealmInitializer/ClientInitializer/RoleInitializer/…
+      # startup path (the source of the 401 flood). IAM owns Keycloak and provisions
+      # event-app from ivy-events-be's iam-manifest.yml (see PROVISIONING_TOKEN below).
+      - IVY_LEGACY_INITIALIZERS_WRITE_ENABLED=false
+      # Workaround: ivy-events-be currently defines two beans named `iamClient`
+      # (IamClientConfig#iamClient vs IamClientHealthIndicator). Real app bug to
+      # fix in source; overriding lets it boot locally meanwhile.
+      - SPRING_MAIN_ALLOW_BEAN_DEFINITION_OVERRIDING=true
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/ivy_events_db
+      - SPRING_DATASOURCE_USERNAME=${POSTGRES_USER:-postgres}
+      - SPRING_DATASOURCE_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      # Keycloak — admin/provisioning calls go to the in-network host, but the
+      # JWT issuer stays localhost:8181 so browser-minted tokens validate; only
+      # the JWKS fetch is redirected internally.
+      - KEYCLOAK_SERVER_URL=http://keycloak:8080
+      - KEYCLOAK_APP_REALM=event-app
+      - KEYCLOAK_TOKEN_URL=http://keycloak:8080/realms/event-app/protocol/openid-connect/token
+      - KEYCLOAK_ISSUER_URI=http://localhost:${KEYCLOAK_PORT:-8181}/realms/event-app
+      - SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWKSETURI=http://keycloak:8080/realms/event-app/protocol/openid-connect/certs
+      - KEYCLOAK_MASTER_REALM=master
+      - KEYCLOAK_ADMIN_USERNAME=${KEYCLOAK_ADMIN:-admin}
+      - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      - KEYCLOAK_CLIENT_ID=${IVY_KEYCLOAK_CLIENT_ID:-admin-service}
+      - KEYCLOAK_CLIENT_SECRET=${IVY_KEYCLOAK_CLIENT_SECRET:-}
+      # iam-service integration (best-effort locally)
+      - IAM_BASE_URL=http://zm-iam-service:8383
+      - IAM_TOKEN_URL=http://keycloak:8080/realms/zm-services/protocol/openid-connect/token
+      - IAM_PROVISIONING_FAILURE_MODE=LOG_AND_CONTINUE
+      # Provisioning client (IVY-BE-01). The DEFAULT profile doesn't bind these
+      # from application.yml (only local/prod profiles do), so without them the
+      # manifest POST builds a scheme-less URI → "URI with undefined scheme".
+      # IAM_BASE_URL feeds iam.client.* (runtime), NOT iam.provisioning.*.
+      - IAM_PROVISIONING_BASE_URL=http://zm-iam-service:8383
+      - IAM_PROVISIONING_TOKEN=local-dev-token
+      # Route ivy-be email through zm-notification-service over Kafka (async).
+      - KAFKA_BOOTSTRAP=kafka:29092
+      - NOTIFICATION_VIA_EVENTS=true
+      - NOTIFICATION_TOPIC=zm.notifications.v1
+      # iam-manifest.yml interpolates ${APP_DOMAIN} at load time (ManifestLoader).
+      # Local → localhost:5173 (the manifest also keeps a plain http://localhost:5173
+      # redirect, so the derived https://${APP_DOMAIN} entry is just harmless extra).
+      - APP_DOMAIN=${APP_DOMAIN:-localhost:5173}
+      # Base URLs / CORS
+      - BACKEND_BASE_URL=http://localhost:8081
+      # IVY-103: collaborator invites are minted and redeemed by
+      # zm-organization-service. The default base-url is localhost, which from
+      # inside a container means the container itself — it has to be the
+      # service name here.
+      # Keycloak generates this secret for ivy-events-be-svc; IAM does not pin it,
+      # so nothing carried it to the caller and every client_credentials call
+      # got 401. Read it back from Keycloak and pass it in until IAM sets a
+      # deterministic one (platform gap, worth its own ticket).
+      - IAM_SVC_CLIENT_SECRET=${IAM_SVC_CLIENT_SECRET:-u07mUBRnNzYYFS4gQmDsQPL2V5WFv0AM}
+      - ORG_SERVICE_ENABLED=true
+      - ORG_SERVICE_BASE_URL=http://zm-organization-service:8484
+      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-http://localhost:5173}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:5174}
+      # Storage (local by default; flip to s3 + AWS creds to test S3)
+      - STORAGE_PROVIDER=${STORAGE_PROVIDER:-local}
+      - STORAGE_LOCAL_PATH=uploads
+      - S3_BUCKET=${S3_BUCKET:-ivy-events}
+      - AWS_REGION=${AWS_REGION:-eu-central-1}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+    volumes:
+      - ivy_uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak-bootstrap:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  ivy-events-fe:
+    build:
+      context: ../ivy-events-fe
+    container_name: zm_ivy_events_fe
+    ports:
+      - "${IVY_FE_PORT:-5173}:80"
+    environment:
+      # APP_ENV must NOT be prod/test locally, or the entrypoint derives the
+      # public ivyevents.mk URLs. Anything else → localhost:8081 / :8181.
+      - APP_ENV=local
+      # Two addresses, because two services answer. Auth (register, login,
+      # verify, password reset) is zm-iam-service; everything else — events,
+      # guests, tasks, budgets, media — is ivy-events-be. Pointing both at one
+      # of them breaks the other half.
+      - VITE_API_BASE_URL=http://localhost:${IVY_BE_PORT:-8081}
+      - VITE_IAM_BASE_URL=http://localhost:${IAM_PORT:-8282}
+      - VITE_KEYCLOAK_URL=http://localhost:${KEYCLOAK_PORT:-8181}
+      - VITE_KEYCLOAK_REALM=event-app
+      - VITE_KEYCLOAK_CLIENT_ID=eventFE
+      - VITE_GOOGLE_MAPS_API_KEY=${VITE_GOOGLE_MAPS_API_KEY:-}
+    depends_on:
+      - ivy-events-be
+    restart: unless-stopped
+
+  # ───────────────────────────────────────────────────────────────
+  # Edge (optional — proxies /api on :80 to the BE)
+  # ───────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: zm_nginx
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - ivy-events-be
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  kafka_data:
+  ivy_uploads:

@@ -1,0 +1,2 @@
+# Drop exported realm JSON here; Keycloak auto-imports on boot.
+# Default local-dev uses the built-in `master` realm — no file required.

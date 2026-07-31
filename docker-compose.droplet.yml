@@ -1,0 +1,68 @@
+# Droplet compose for the notification stack (test AND prod — same file).
+# Brings up Kafka + zm-notification-service and joins the EXISTING `ivy-net`
+# network that ivy-iam / ivy-events-be / keycloak already run on (those are
+# deployed via their own docker-run workflows and are NOT managed here).
+#
+# Usage on a droplet:
+#   # optional per-env overrides (prod: real ZeptoMail token, etc.)
+#   #   echo 'ZEPTO_TOKEN=Zoho-enczapikey ...' > .env
+#   docker compose -f docker-compose.droplet.yml pull
+#   docker compose -f docker-compose.droplet.yml up -d
+#
+# Test vs prod differ only by the .env values (and which droplet you run on).
+
+services:
+  # ── Kafka (KRaft single-node) — internal listener only; only containers
+  #    on ivy-net talk to it, so it advertises kafka:9092 (no host listener). ──
+  kafka:
+    image: apache/kafka:3.7.1
+    container_name: kafka
+    networks: [ivy-net]
+    environment:
+      - KAFKA_NODE_ID=1
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
+      - KAFKA_LOG_DIRS=/var/lib/kafka/data
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    restart: unless-stopped
+
+  # ── Notification service — consumes zm.notifications.v1, sends via ZeptoMail.
+  #    Image is built + pushed by .github/workflows/deploy-*.yml (Docker Hub). ──
+  zm-notification-service:
+    image: zmtechlabs/zm-notification-service:latest
+    container_name: zm-notification-service
+    networks: [ivy-net]
+    ports:
+      - "${NOTIFICATION_PORT:-8384}:8384"
+    environment:
+      - SERVER_PORT=8384
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - NOTIFICATION_TOPIC=zm.notifications.v1
+    # ZeptoMail token/from ship as working defaults baked into the image, so
+    # TEST needs nothing. For PROD, drop a `notification.env` next to this file
+    # with the real values (ZEPTO_TOKEN=..., ZEPTO_FROM_ADDRESS=...). Optional —
+    # if the file is absent it's ignored and the baked defaults apply.
+    env_file:
+      - path: notification.env
+        required: false
+    depends_on:
+      - kafka
+    restart: unless-stopped
+
+# ivy-net already exists on the droplet (created by the other services' deploys).
+networks:
+  ivy-net:
+    external: true
+
+volumes:
+  kafka_data:
