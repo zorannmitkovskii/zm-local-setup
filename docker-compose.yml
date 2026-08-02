@@ -176,6 +176,10 @@ services:
       # clientIdEnvRef/clientSecretEnvRef. IAM (IdpReconciler) resolves these
       # from ITS OWN env at apply time — if unset it throws before any Keycloak
       # write and rolls back the whole manifest, so eventFE never gets created.
+      # Referenced by name from ivy-events-be's manifest (secretEnvRef).
+      # IAM resolves it from its OWN env at apply time and sets it on the
+      # client, which is what makes the secret knowable to both sides.
+      - IVY_EVENTS_BE_SVC_SECRET=${IVY_EVENTS_BE_SVC_SECRET:-ivy-events-be-local-secret}
       - IVY_GOOGLE_CLIENT_ID=${IVY_GOOGLE_CLIENT_ID:-}
       - IVY_GOOGLE_CLIENT_SECRET=${IVY_GOOGLE_CLIENT_SECRET:-}
       # Route public-auth emails through zm-notification-service over Kafka
@@ -390,11 +394,11 @@ services:
       # zm-organization-service. The default base-url is localhost, which from
       # inside a container means the container itself — it has to be the
       # service name here.
-      # Keycloak generates this secret for ivy-events-be-svc; IAM does not pin it,
-      # so nothing carried it to the caller and every client_credentials call
-      # got 401. Read it back from Keycloak and pass it in until IAM sets a
-      # deterministic one (platform gap, worth its own ticket).
-      - IAM_SVC_CLIENT_SECRET=${IAM_SVC_CLIENT_SECRET:-u07mUBRnNzYYFS4gQmDsQPL2V5WFv0AM}
+      # Same value IAM is told to pin via secretEnvRef below. One variable,
+      # two consumers: IAM sets it on the Keycloak client, this service uses it
+      # to authenticate. Previously Keycloak generated it and nobody could
+      # carry it across, so every client_credentials call was a 401.
+      - IAM_SVC_CLIENT_SECRET=${IVY_EVENTS_BE_SVC_SECRET:-ivy-events-be-local-secret}
       - ORG_SERVICE_ENABLED=true
       - ORG_SERVICE_BASE_URL=http://zm-organization-service:8484
       - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-http://localhost:5173}
