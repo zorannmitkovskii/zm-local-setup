@@ -99,6 +99,22 @@ services:
       - kafka_data:/var/lib/kafka/data
     restart: unless-stopped
 
+  # Edit locks for the seating editor (ivy-events, IVY-504). Deliberately not
+  # persisted: a lock that survives a restart is a lock nobody can release, and
+  # the whole point of one is that it expires.
+  redis:
+    image: redis:7-alpine
+    container_name: zm_redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: zm_kafka_ui
