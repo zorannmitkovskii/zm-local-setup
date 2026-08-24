@@ -188,6 +188,21 @@ services:
       # ROLE_PROVISIONING), so ivy-events-be's manifest applies without minting
       # argon2 tokens. Prod/test leave this unset (defaults true) + real tokens.
       - IAM_PROVISIONING_SECURITY_ENABLED=false
+      # Organizer signup creates the agency's organization here, at the moment
+      # the email is verified, so the account is complete before its owner ever
+      # opens a screen. Unset, an organizer signup fails loudly instead of
+      # producing an account that 403s everywhere with no explanation.
+      - ORG_BASE_URL=http://zm-organization-service:8484
+      # LOCAL ONLY, and a compromise worth naming: this is ivy-events-be's
+      # service identity, borrowed because it is the only client in zm-services
+      # already carrying org-service's `org-client` role. IAM has no service
+      # account of its own — it is the thing that provisions them for everyone
+      # else — so giving it one is real work, not a config line. Until then an
+      # organization created at signup is attributed to ivy-events-be in the
+      # registry's audit trail: wrong, but wrong visibly.
+      - ORG_TOKEN_URL=http://keycloak:8080/realms/zm-services/protocol/openid-connect/token
+      - ORG_CLIENT_ID=ivy-events-be-svc
+      - ORG_CLIENT_SECRET=${IVY_EVENTS_BE_SVC_SECRET:-ivy-events-be-local-secret}
       # Google IdP creds referenced by ivy-events-be's iam-manifest.yml via
       # clientIdEnvRef/clientSecretEnvRef. IAM (IdpReconciler) resolves these
       # from ITS OWN env at apply time — if unset it throws before any Keycloak
@@ -361,15 +376,36 @@ services:
       - "${IVY_BE_PORT:-8081}:8081"
     environment:
       - SERVER_PORT=8081
+      # The four demo logins (admin/organizer/vendor/user @ivy.test) plus the
+      # events, guests, tasks, budgets, seating, packages and vendors behind
+      # them. Local only — the seeder writes accounts whose password is in the
+      # repository. See ivy-events-be/TEST-USERS.md.
+      - IVY_DEMO_DATA_ENABLED=${IVY_DEMO_DATA_ENABLED:-true}
+      - IVY_DEMO_DATA_PASSWORD=${IVY_DEMO_DATA_PASSWORD:-Test123!}
       # Full IAM-authority mode: BE must NOT touch the Keycloak Admin API.
       # This disables the legacy RealmInitializer/ClientInitializer/RoleInitializer/…
       # startup path (the source of the 401 flood). IAM owns Keycloak and provisions
       # event-app from ivy-events-be's iam-manifest.yml (see PROVISIONING_TOKEN below).
       - IVY_LEGACY_INITIALIZERS_WRITE_ENABLED=false
-      # Workaround: ivy-events-be currently defines two beans named `iamClient`
-      # (IamClientConfig#iamClient vs IamClientHealthIndicator). Real app bug to
-      # fix in source; overriding lets it boot locally meanwhile.
-      - SPRING_MAIN_ALLOW_BEAN_DEFINITION_OVERRIDING=true
+      # The duplicate-`iamClient` workaround that used to live here is gone:
+      # IamClientHealthIndicator now takes Spring's default bean name, so the
+      # clash it worked around no longer exists. Bean-definition overriding is
+      # left OFF deliberately — with it on, the next accidental duplicate boots
+      # quietly and wins at random instead of failing at startup.
+      # Signs the QR credential a guest arrives with (IVY-601). The service
+      # refuses to start without it and ships no default, deliberately: a
+      # default here is a key every deployment shares, and anyone who has it can
+      # mint a credential that walks through the door. So the value below is
+      # local-only and obviously so — prod and test set their own via .env.
+      # HS256 needs 32 bytes minimum; a shorter one is rejected at startup
+      # rather than signing something forgeable.
+      - IVY_CREDENTIAL_SIGNING_KEY=${IVY_CREDENTIAL_SIGNING_KEY:-local-development-only-key-not-for-any-real-deployment}
+      # Seating edit locks (IVY-504). Redis has been in this stack since the
+      # editor shipped and nothing pointed the service at it — the default host
+      # is localhost, which inside a container is the container, so locking
+      # silently took the degraded path and two people could drag the same plan.
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
       - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/ivy_events_db
       - SPRING_DATASOURCE_USERNAME=${POSTGRES_USER:-postgres}
       - SPRING_DATASOURCE_PASSWORD=${POSTGRES_PASSWORD:-postgres}
@@ -418,6 +454,11 @@ services:
       - ORG_SERVICE_ENABLED=true
       - ORG_SERVICE_BASE_URL=http://zm-organization-service:8484
       - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-http://localhost:5173}
+      # Canonical tags, hreflang alternates and the sitemap are all built from
+      # this. Unset it and the default profile advertises https://ivyevents.mk
+      # while serving from localhost — which is only visible in page source and
+      # in /sitemap.xml, so it survives a lot of manual testing.
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://localhost:5173}
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:5174}
       # Storage (local by default; flip to s3 + AWS creds to test S3)
       - STORAGE_PROVIDER=${STORAGE_PROVIDER:-local}
@@ -430,6 +471,8 @@ services:
       - ivy_uploads:/app/uploads
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       keycloak-bootstrap:
         condition: service_completed_successfully
