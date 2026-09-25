@@ -1,9 +1,9 @@
 # Build context is the ZM workspace root (C:/Projects/ZM) so this build can
 # see BOTH ivy-events-be and its private dependency zm-iam-provisioning-client.
-# All compilation happens with JDK 21 from the maven base image — the host JDK
+# All compilation happens with JDK 25 from the maven base image — the host JDK
 # is irrelevant.
 
-FROM maven:3.9-eclipse-temurin-21 AS builder
+FROM maven:3-eclipse-temurin-25 AS builder
 WORKDIR /workspace
 
 # jitpack.io is declared in ivy-events-be/pom.xml for one artifact:
@@ -76,7 +76,7 @@ COPY ivy-events-be/src ivy-events-be/src
 RUN mvn -B -f ivy-events-be/pom.xml package -DskipTests -U
 
 # 3) Slim runtime.
-FROM eclipse-temurin:21-jre-alpine
+FROM eclipse-temurin:25-jre-alpine
 WORKDIR /app
 COPY --from=builder /workspace/ivy-events-be/target/*.jar /app/app.jar
 EXPOSE 8081
