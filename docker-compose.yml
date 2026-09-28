@@ -211,8 +211,8 @@ services:
       # IAM resolves it from its OWN env at apply time and sets it on the
       # client, which is what makes the secret knowable to both sides.
       - IVY_EVENTS_BE_SVC_SECRET=${IVY_EVENTS_BE_SVC_SECRET:-ivy-events-be-local-secret}
-      - IVY_GOOGLE_CLIENT_ID=${IVY_GOOGLE_CLIENT_ID:-}
-      - IVY_GOOGLE_CLIENT_SECRET=${IVY_GOOGLE_CLIENT_SECRET:-}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
       # Route public-auth emails through zm-notification-service over Kafka
       # (async). Locally Kafka is present, so turn events ON here.
       - KAFKA_BOOTSTRAP=kafka:29092
