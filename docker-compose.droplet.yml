@@ -13,17 +13,19 @@
 
 services:
   # ── Kafka (KRaft single-node) — internal listener only; only containers
-  #    on ivy-net talk to it, so it advertises kafka:9092 (no host listener). ──
-  kafka:
+  #    on ivy-net talk to it, so it advertises zm-kafka:9092 (no host listener). ──
+  zm-kafka:
     image: apache/kafka:3.7.1
-    container_name: kafka
+    container_name: zm-kafka
     networks: [ivy-net]
     environment:
+      # The droplet has 2 GB RAM; the image default heap (1 GB) gets OOM-killed.
+      - KAFKA_HEAP_OPTS=-Xms256m -Xmx256m
       - KAFKA_NODE_ID=1
       - KAFKA_PROCESS_ROLES=broker,controller
-      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@zm-kafka:9093
       - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
-      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://zm-kafka:9092
       - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
       - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
@@ -46,7 +48,7 @@ services:
       - "${NOTIFICATION_PORT:-8384}:8384"
     environment:
       - SERVER_PORT=8384
-      - KAFKA_BOOTSTRAP=kafka:9092
+      - KAFKA_BOOTSTRAP=zm-kafka:9092
       - NOTIFICATION_TOPIC=zm.notifications.v1
     # ZeptoMail token/from ship as working defaults baked into the image, so
     # TEST needs nothing. For PROD, drop a `notification.env` next to this file
@@ -56,7 +58,7 @@ services:
       - path: notification.env
         required: false
     depends_on:
-      - kafka
+      - zm-kafka
     restart: unless-stopped
 
 # ivy-net already exists on the droplet (created by the other services' deploys).
