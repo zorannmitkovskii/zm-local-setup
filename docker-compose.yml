@@ -188,21 +188,6 @@ services:
       # ROLE_PROVISIONING), so ivy-events-be's manifest applies without minting
       # argon2 tokens. Prod/test leave this unset (defaults true) + real tokens.
       - IAM_PROVISIONING_SECURITY_ENABLED=false
-      # Organizer signup creates the agency's organization here, at the moment
-      # the email is verified, so the account is complete before its owner ever
-      # opens a screen. Unset, an organizer signup fails loudly instead of
-      # producing an account that 403s everywhere with no explanation.
-      - ORG_BASE_URL=http://zm-organization-service:8484
-      # LOCAL ONLY, and a compromise worth naming: this is ivy-events-be's
-      # service identity, borrowed because it is the only client in zm-services
-      # already carrying org-service's `org-client` role. IAM has no service
-      # account of its own — it is the thing that provisions them for everyone
-      # else — so giving it one is real work, not a config line. Until then an
-      # organization created at signup is attributed to ivy-events-be in the
-      # registry's audit trail: wrong, but wrong visibly.
-      - ORG_TOKEN_URL=http://keycloak:8080/realms/zm-services/protocol/openid-connect/token
-      - ORG_CLIENT_ID=ivy-events-be-svc
-      - ORG_CLIENT_SECRET=${IVY_EVENTS_BE_SVC_SECRET:-ivy-events-be-local-secret}
       # Google IdP creds referenced by ivy-events-be's iam-manifest.yml via
       # clientIdEnvRef/clientSecretEnvRef. IAM (IdpReconciler) resolves these
       # from ITS OWN env at apply time — if unset it throws before any Keycloak

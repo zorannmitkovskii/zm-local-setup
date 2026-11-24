@@ -38,6 +38,21 @@ services:
       - kafka_data:/var/lib/kafka/data
     restart: unless-stopped
 
+  # ── Redis — seating locks and rate limits for ivy-events-be, which finds it
+  #    through REDIS_HOST=ivy-redis in be.env. Nothing here outlives a TTL, so no
+  #    persistence; only containers on ivy-net can reach it. ──
+  ivy-redis:
+    image: redis:7-alpine
+    container_name: ivy-redis
+    networks: [ivy-net]
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
   # ── Notification service — consumes zm.notifications.v1, sends via ZeptoMail.
   #    Image is built + pushed by .github/workflows/deploy-*.yml (Docker Hub). ──
   zm-notification-service:
